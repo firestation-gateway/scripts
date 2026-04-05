@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Copyright (c) 2026 firestation-gateway
+# License: MIT | https://raw.githubusercontent.com/firestation-gateway/scripts/main/LICENSE
+
+FSG_INSTALL_PATH=/opt/firestation-gateway
+FSG_USER=$USER
+WEB_USER=www-data
+FSG_SYSTEMD_SERVICE=firestation-gateway.service
+
+fsg_latest_version() {
+  version=$(curl -H "Cache-Control: no-cache" -fsSL https://raw.githubusercontent.com/firestation-gateway/scripts/main/app/fsg/latest_version)
+  if [[ -z "$version" ]]; then
+    echo "0.0.0"
+    return 1
+  fi
+  echo "$version"
+  return 0
+}
+
+fsg_version() {
+  if [[ -f ${FSG_INSTALL_PATH}/venv/bin/python3 ]]; then
+    # dry to get current version
+    echo "$(${FSG_INSTALL_PATH}/venv/bin/python3 -c 'import firestation_gateway; print(firestation_gateway.__version__)' 2>/dev/null)"
+  fi
+}
+
+# <download_path> [<version> default latest version]
+# return: wheel-file-path
+fsg_download_wheel() {
+  local dl_dir="${1}"
+  local version="${2:-$(fsg_latest_version)}"
+
+  local dl_url=https://github.com/firestation-gateway/firestation-gateway/releases/download/${version}/firestation_gateway-${version}-py3-none-any.whl
+  local wheel_path=${dl_dir}/firestation_gateway-${version}-py3-none-any.whl
+
+  curl --progress-bar -L ${dl_url} -o ${wheel_path} 1>&2
+  realpath ${wheel_path}
+}
+
+# FSG_INSTALL_PATH
+# FSG_USER
+# 
+# <wheel_path>
+install_fsg() {
+  local path="${FSG_INSTALL_PATH}"
+  local app_user="${FSG_USER}"
+  local wheel_path="${1}"
+  
+  if [[ -f "${path}/config.yaml" ]]; then
+    local homedir=$( getent passwd "$app_user" | cut -d: -f6 )
+    local bkp_path="$homedir/$(date +"%Y%m%d%H%M%S")-firestation-gateway.yaml"
+
+    out_info "Sichere vorhandene firestation-gateway Konfiguration => ${bkp_path}"
+    cp ${path}/config.yaml ${bkp_path}
+    chown -R ${app_user}:${app_user} ${bkp_path}
+  fi
+
+  mkdir -p ${path}
+  find ${path}/ -xdev -mindepth 1 -not -path "${path}/web" -delete
+  
+  cd ${path}
+
+  out_info "Installiere virtuelle Umgebung..."
+  python3 -m venv "${path}/venv"
+  . "${path}/venv/bin/activate"
+  pip install -q --no-cache-dir --upgrade pip
+
+  out_info "Installiere ${wheel_path}..."
+  pip install -q --no-cache-dir --force-reinstall ${wheel_path}
+
+  if [[ -n "${bkp_path:-}" ]]; then
+      # restore current config
+      out_info "Konfigurationsdatei: Wird wieder hergestellt..."
+      cp -v $bkp_path ${path}/config.yaml
+  else
+      firestation-gw --generate-config > ${path}/config.yaml
+      out_info "Konfigurationsdatei: Wird generiert..."
+  fi
+
+  chown -R ${app_user}:${app_user} ${path}
+  # user need access to gpio
+  usermod -aG gpio ${app_user}
+
+  setup_systemd_service
+
+  out 
+  out "${BOLD}Verzeichnis: ${path}${RESET}"
+  out "${BOLD}Benutzer:    ${app_user}${RESET}"
+  out
+
+  out_ok "Firestation Installation erfolgreich."
+}
+
+setup_systemd_service() {
+  local path="/etc/systemd/system/${FSG_SYSTEMD_SERVICE}"
+  local app_path="${FSG_INSTALL_PATH}/venv/bin/firestation-gw"
+  local app_wdir="${FSG_INSTALL_PATH}"
+  local app_user="${FSG_USER}"
+  local service_name="${FSG_SYSTEMD_SERVICE}"
+
+  out_info "Aktiviere Firestation Gateway Service..."
+
+  sh -c "cat <<EOF > ${path}
+[Unit]
+Description=Firestation Gateway
+After=network.target
+
+[Service]
+WorkingDirectory=${app_wdir}
+ExecStart=${app_path}
+Restart=always
+User=${app_user}
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+
+  systemctl daemon-reload
+  systemctl enable --now "$service_name"
+  systemctl restart "$service_name"
+  out_ok "Service aktiv: $service_name"
+
+}
+
+# <server_name> <html_doc_root> <>
+install_fsg_webfrontend() {
+  local server_name="${1}" # $(hostname).local
+  local path=${2:-${FSG_INSTALL_PATH}/web}
+  local web_user=${3:-www-data}
+
+  local key_file=/etc/ssl/private/Firestation-Gateway-self-signed.key
+  local crt_file=/etc/ssl/certs/Firestation-Gateway-self-signed.crt
+  local app_url=https://github.com/firestation-gateway/firestation-web/archive/refs/heads/main.tar.gz
+
+  out_info "Installiere firestation-web..."
+
+  if [[ -d "${path}" ]]; then
+    out "${INFO}${BOLD}Verzeichnis '${path}' existiert.${RESET}"
+    ask "Überschreiben?"
+    if [[ "$ask_rc" -eq 0 ]]; then
+      out_warn "Installation abgebrochen."
+      return
+    fi
+  fi
+  
+  mkdir -p ${path}
+  find ${path} -xdev -mindepth 1 -delete
+  out_info "Download firestation-web..."
+  
+  cd ${path}
+  curl --progress-bar -L ${app_url} | tar -xzf - --strip-components 1
+  chown -R ${web_user}:${web_user} ${path}
+
+  out_info "Installiere Abhängigkeiten..."
+  # install dependency
+  apt update -qq
+  # TODO: use composer
+  apt install -qqq -y apache2 php php-symfony-yaml php-yaml libapache2-mod-php
+
+  a2dissite ${server_name}.conf &>/dev/null || true
+
+  service apache2 restart
+
+  a2enmod rewrite >/dev/null
+  # enable SSL
+  a2enmod ssl >/dev/null
+  if [[ ! -f $key_file || ! -f $crt_file ]]; then
+    out_info "Generate SSL cert..."
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout $key_file \
+        -out $crt_file \
+        -subj "/C=DE/O=Firestation-Gateway/CN=${server_name}"
+  else
+    out_info "SSL cert exists. Do not generate new one."
+  fi
+  # copy site config
+
+  sh -c 'cat <<EOF > '/etc/apache2/sites-available/${server_name}.conf'
+Listen 8080
+<VirtualHost *:8080>
+    ServerName "'${server_name}'.conf"
+    DocumentRoot "'${path}'"
+    <Directory '${path}'>
+        AllowOverride All
+        Require all granted
+    </Directory>
+    SSLEngine on
+    SSLCertificateFile      '$crt_file'
+    SSLCertificateKeyFile   '$key_file'
+
+</VirtualHost>
+EOF'
+  # disable default site
+  # a2dissite 000-default.conf 
+  # enable website
+  a2ensite ${server_name}.conf >/dev/null
+  service apache2 reload
+
+  grant_permissions_website
+
+  local_ip=$(get_current_ip)
+  out
+  out "Webfrontend"
+  out "${TAB}url: https://localhost:8080"
+  if [[ -n "$local_ip" ]]; then
+    out "${TAB}url: https://${local_ip}:8080"
+  fi
+  out "Konfigurationsdatei unter '${path}/conf/config.ini'"
+  out "${TAB}Benutzer: admin"
+  out "${TAB}Passwort: admin"
+  out
+
+  out_ok "Firestation Webfrontend Installation erfolgreich."
+}
+
+# Grant the web app the necessary permissions
+# <systemd_service> [<web_user> default www-data]
+grant_permissions_website() {
+  local web_user=${1:-${WEB_USER}}
+  local systemd_service="${FSG_SYSTEMD_SERVICE}"  # firestation-gateway.service
+  local cfg_path="${FSG_INSTALL_PATH}/config.yaml"
+  local path=""
+
+  # web-frontend need this
+  # TODO: find a better solution for this
+  sh -c 'cat <<EOF > /etc/sudoers.d/99-firestation-web
+'${web_user}' ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart '$systemd_service'
+'${web_user}' ALL=(ALL) NOPASSWD: /usr/bin/journalctl -u '$systemd_service' -n 40 --no-pager
+EOF'
+
+  chgrp ${web_user} ${cfg_path}
+  chmod 0660 ${cfg_path}
+}
